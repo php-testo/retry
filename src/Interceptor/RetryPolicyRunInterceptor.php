@@ -9,6 +9,7 @@ use Testo\Core\Context\TestInfo;
 use Testo\Core\Context\TestResult;
 use Testo\Core\Value\Status;
 use Testo\Event\Test\TestRetrying;
+use Testo\Messenger;
 use Testo\Pipeline\Attribute\InterceptorOptions;
 use Testo\Pipeline\Middleware\TestRunInterceptor;
 use Testo\Pipeline\Policy\ConflictPolicy;
@@ -24,10 +25,20 @@ use Testo\Retry;
 #[InterceptorOptions(order: InterceptorOptions::ORDER_DEFAULT - 200, onConflict: ConflictPolicy::Last)]
 final readonly class RetryPolicyRunInterceptor implements TestRunInterceptor
 {
+    /**
+     * Channel the breadcrumbs for discarded (retried) attempts are written to.
+     */
+    public const CHANNEL = 'retry';
+
+    private Messenger\Channel $channel;
+
     public function __construct(
         private Retry $options,
         private EventDispatcherInterface $eventDispatcher,
-    ) {}
+        Messenger $messenger,
+    ) {
+        $this->channel = $messenger->channel(self::CHANNEL);
+    }
 
     #[\Override]
     public function runTest(TestInfo $info, callable $next): TestResult
@@ -35,15 +46,23 @@ final readonly class RetryPolicyRunInterceptor implements TestRunInterceptor
         $attempts = $this->options->maxAttempts;
         $isFlaky = false;
 
+        $attempt = 1;
         run:
         --$attempts;
-        $attempt = 1;
         /** @var TestResult $result */
         $result = $next($info);
 
         if ($result->status->isFailure()) {
             # Test failed, check if we can retry
             if ($attempts > 0) {
+                # The attempt's own output went into the dropped fork; leave a breadcrumb in the
+                # parent scope so the discarded attempt still leaves a trace in the test's output.
+                $this->channel->warning(
+                    $result->failure === null
+                        ? "Attempt $attempt failed.\n"
+                        : "Attempt $attempt failed: {$result->failure->getMessage()}\n",
+                );
+
                 $isFlaky = true;
                 $this->eventDispatcher->dispatch(
                     new TestRetrying($info, ++$attempt, $result),
